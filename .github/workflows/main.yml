@@ -24,6 +24,7 @@ jobs:
   # ============================================================
   build:
     name: Build ${{ matrix.service }}
+
     runs-on: ubuntu-latest
 
     strategy:
@@ -34,9 +35,15 @@ jobs:
           - worker
 
     steps:
+      # --------------------------------------------------------
+      # CHECKOUT
+      # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      # --------------------------------------------------------
+      # LOGIN TO GHCR
+      # --------------------------------------------------------
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
@@ -44,34 +51,57 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # --------------------------------------------------------
+      # MULTI-ARCH SUPPORT
+      # --------------------------------------------------------
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # --------------------------------------------------------
+      # IMAGE NAME
+      # --------------------------------------------------------
       - name: Prepare image name
         id: image
         shell: bash
         run: |
           REPOSITORY=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+
           IMAGE_NAME="ghcr.io/${REPOSITORY}-${{ matrix.service }}"
 
           echo "name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
 
-          echo "Image: $IMAGE_NAME"
+          echo "Building:"
+          echo "$IMAGE_NAME"
 
-      - name: Build and push
+      # --------------------------------------------------------
+      # BUILD + PUSH
+      # --------------------------------------------------------
+      - name: Build and push image
         uses: docker/build-push-action@v7
         with:
           context: ./${{ matrix.service }}
+
+          platforms: |
+            linux/amd64
+            linux/arm64
+
           push: true
+
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
             ${{ steps.image.outputs.name }}:latest
 
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          cache-from: |
+            type=gha,scope=${{ matrix.service }}
+
+          cache-to: |
+            type=gha,mode=max,scope=${{ matrix.service }}
 
   # ============================================================
-  # DEPLOY
+  # DEPLOY TO MINIKUBE
   # ============================================================
   deploy:
     name: Deploy to Minikube
@@ -82,13 +112,16 @@ jobs:
     runs-on: self-hosted
 
     steps:
+      # --------------------------------------------------------
+      # CHECKOUT
+      # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v6
 
       # --------------------------------------------------------
-      # PATH
+      # PATH FOR MACOS / HOMEBREW
       # --------------------------------------------------------
-      - name: Add Homebrew to PATH
+      - name: Configure PATH
         shell: bash
         run: |
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
@@ -97,12 +130,13 @@ jobs:
       # --------------------------------------------------------
       # CHECK CLUSTER
       # --------------------------------------------------------
-      - name: Check Kubernetes
+      - name: Check Kubernetes cluster
         shell: bash
         run: |
           echo "=== Context ==="
           kubectl config current-context
 
+          echo
           echo "=== Nodes ==="
           kubectl get nodes
 
@@ -119,9 +153,9 @@ jobs:
             --timeout=180s
 
       # --------------------------------------------------------
-      # PRIVATE GHCR AUTH
+      # PRIVATE GHCR SECRET
       # --------------------------------------------------------
-      - name: Configure private GHCR access
+      - name: Create GHCR pull secret
         shell: bash
         env:
           GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
@@ -137,7 +171,7 @@ jobs:
             | kubectl apply -f -
 
       # --------------------------------------------------------
-      # ATTACH PULL SECRET TO DEFAULT SERVICE ACCOUNT
+      # DEFAULT SERVICE ACCOUNT -> GHCR SECRET
       # --------------------------------------------------------
       - name: Configure image pull secret
         shell: bash
@@ -147,6 +181,8 @@ jobs:
             --type=merge \
             -p '{"imagePullSecrets":[{"name":"ghcr-pull-secret"}]}'
 
+          echo "=== ServiceAccount ==="
+
           kubectl get serviceaccount default \
             --namespace "$NAMESPACE" \
             -o yaml
@@ -154,7 +190,7 @@ jobs:
       # --------------------------------------------------------
       # IMAGE NAMES
       # --------------------------------------------------------
-      - name: Prepare image names
+      - name: Prepare deployment image names
         shell: bash
         run: |
           REPOSITORY=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
@@ -165,8 +201,11 @@ jobs:
           echo "API_IMAGE=$API_IMAGE" >> "$GITHUB_ENV"
           echo "WORKER_IMAGE=$WORKER_IMAGE" >> "$GITHUB_ENV"
 
-          echo "API: $API_IMAGE"
-          echo "Worker: $WORKER_IMAGE"
+          echo "API image:"
+          echo "$API_IMAGE"
+
+          echo "Worker image:"
+          echo "$WORKER_IMAGE"
 
       # --------------------------------------------------------
       # APPLY MANIFESTS
@@ -179,16 +218,16 @@ jobs:
             -f manifests/
 
       # --------------------------------------------------------
-      # SET EXACT IMAGE VERSION
+      # UPDATE EXACT IMAGE SHA
       # --------------------------------------------------------
-      - name: Deploy API image
+      - name: Update API image
         shell: bash
         run: |
           kubectl set image deployment/api \
             api="$API_IMAGE" \
             --namespace "$NAMESPACE"
 
-      - name: Deploy Worker image
+      - name: Update Worker image
         shell: bash
         run: |
           kubectl set image deployment/worker \
@@ -218,23 +257,52 @@ jobs:
       - name: Show deployment status
         shell: bash
         run: |
-          echo "=== Pods ==="
+          echo "=============================="
+          echo "PODS"
+          echo "=============================="
+
           kubectl get pods \
-            --namespace "$NAMESPACE"
+            --namespace "$NAMESPACE" \
+            -o wide
 
           echo
-          echo "=== Deployments ==="
+          echo "=============================="
+          echo "DEPLOYMENTS"
+          echo "=============================="
+
           kubectl get deployments \
             --namespace "$NAMESPACE"
 
           echo
-          echo "=== API image ==="
+          echo "=============================="
+          echo "SERVICES"
+          echo "=============================="
+
+          kubectl get services \
+            --namespace "$NAMESPACE"
+
+          echo
+          echo "=============================="
+          echo "INGRESS"
+          echo "=============================="
+
+          kubectl get ingress \
+            --namespace "$NAMESPACE"
+
+          echo
+          echo "=============================="
+          echo "API IMAGE"
+          echo "=============================="
+
           kubectl get deployment api \
             --namespace "$NAMESPACE" \
             -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 
           echo
-          echo "=== Worker image ==="
+          echo "=============================="
+          echo "WORKER IMAGE"
+          echo "=============================="
+
           kubectl get deployment worker \
             --namespace "$NAMESPACE" \
             -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
