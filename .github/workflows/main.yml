@@ -1,0 +1,93 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: devops-app
+
+jobs:
+  build:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service:
+          - api
+          - worker
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}-${{ matrix.service }}:latest
+
+  deploy:
+    name: Deploy with kubectl
+    needs:
+      - build
+
+    # Для ТВОЕГО локального Minikube:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -n "$NAMESPACE" -f manifests/
+
+      - name: Deploy API image
+        run: |
+          kubectl set image deployment/api \
+            api=ghcr.io/${GITHUB_REPOSITORY}-api:${GITHUB_SHA} \
+            -n "$NAMESPACE"
+
+      - name: Deploy Worker image
+        run: |
+          kubectl set image deployment/worker \
+            worker=ghcr.io/${GITHUB_REPOSITORY}-worker:${GITHUB_SHA} \
+            -n "$NAMESPACE"
+
+      - name: Wait for API rollout
+        run: |
+          kubectl rollout status deployment/api \
+            -n "$NAMESPACE" \
+            --timeout=180s
+
+      - name: Wait for Worker rollout
+        run: |
+          kubectl rollout status deployment/worker \
+            -n "$NAMESPACE" \
+            --timeout=180s
+
+      - name: Show status
+        run: |
+          kubectl get pods -n "$NAMESPACE"
+          kubectl get services -n "$NAMESPACE"
