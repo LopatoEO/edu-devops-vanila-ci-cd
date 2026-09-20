@@ -1,24 +1,33 @@
-name: Build and Deploy
+name: CI/CD
 
 on:
   push:
     branches:
       - main
 
+  workflow_dispatch:
+
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
 env:
-  REGISTRY: ghcr.io
-  NAMESPACE: devops-app
+  NAMESPACE: default
 
 jobs:
+  # =========================
+  # BUILD + PUSH
+  # =========================
   build:
     name: Build ${{ matrix.service }}
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         service:
           - api
@@ -31,70 +40,118 @@ jobs:
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image repository
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Prepare image name
         id: image
         shell: bash
         run: |
-          repository="ghcr.io/${GITHUB_REPOSITORY,,}-${{ matrix.service }}"
-          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}-${{ matrix.service }}"
 
-            - name: Set up Buildx
-              uses: docker/setup-buildx-action@v4
+          echo "name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
 
-            - name: Build and push
-              uses: docker/build-push-action@v7
-              with:
-                context: ./${{ matrix.service }}
-                push: true
-                tags: |
-                  ghcr.io/${{ github.repository }}-${{ matrix.service }}:${{ github.sha }}
-                  ghcr.io/${{ github.repository }}-${{ matrix.service }}:latest
+          echo "Image:"
+          echo "$IMAGE_NAME"
 
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # =========================
+  # DEPLOY
+  # =========================
   deploy:
-    name: Deploy with kubectl
+    name: Deploy to Minikube
     needs:
       - build
 
-    # Для ТВОЕГО локального Minikube:
+    # Minikube находится на твоём Mac
     runs-on: self-hosted
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Apply manifests
+      - name: Add Homebrew to PATH
+        shell: bash
         run: |
-          kubectl apply -n "$NAMESPACE" -f manifests/
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
 
-      - name: Deploy API image
+      - name: Check Kubernetes
+        shell: bash
+        run: |
+          kubectl config current-context
+          kubectl get nodes
+
+      - name: Prepare image names
+        shell: bash
+        run: |
+          REPOSITORY="${GITHUB_REPOSITORY,,}"
+
+          echo "API_IMAGE=ghcr.io/${REPOSITORY}-api:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "WORKER_IMAGE=ghcr.io/${REPOSITORY}-worker:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Apply Kubernetes manifests
+        shell: bash
+        run: |
+          kubectl apply \
+            -n "$NAMESPACE" \
+            -f manifests/
+
+      - name: Update API image
+        shell: bash
         run: |
           kubectl set image deployment/api \
-            api=ghcr.io/${GITHUB_REPOSITORY}-api:${GITHUB_SHA} \
+            api="$API_IMAGE" \
             -n "$NAMESPACE"
 
-      - name: Deploy Worker image
+      - name: Update Worker image
+        shell: bash
         run: |
           kubectl set image deployment/worker \
-            worker=ghcr.io/${GITHUB_REPOSITORY}-worker:${GITHUB_SHA} \
+            worker="$WORKER_IMAGE" \
             -n "$NAMESPACE"
 
       - name: Wait for API rollout
+        shell: bash
         run: |
           kubectl rollout status deployment/api \
             -n "$NAMESPACE" \
             --timeout=180s
 
       - name: Wait for Worker rollout
+        shell: bash
         run: |
           kubectl rollout status deployment/worker \
             -n "$NAMESPACE" \
             --timeout=180s
 
-      - name: Show status
+      - name: Show deployment
+        shell: bash
         run: |
+          echo "=== Pods ==="
           kubectl get pods -n "$NAMESPACE"
-          kubectl get services -n "$NAMESPACE"
+
+          echo "=== Deployments ==="
+          kubectl get deployments -n "$NAMESPACE"
+
+          echo "=== Images ==="
+          kubectl get deployment api \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+
+          kubectl get deployment worker \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
