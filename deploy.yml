@@ -52,7 +52,6 @@ jobs:
     needs:
       - build
 
-    # Для ТВОЕГО локального Minikube:
     runs-on: self-hosted
 
     steps:
